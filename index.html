@@ -247,7 +247,8 @@
   /* ── INVOICE ── */
   #invoice-preview {
     width: 794px;
-    min-height: 1123px;
+    /* Use min-height here so it can grow, but we will force height via JS for PDF */
+    min-height: 1123px; 
     background: var(--warm-white);
     box-shadow: 0 32px 80px rgba(0,0,0,0.6);
     position: relative;
@@ -863,7 +864,7 @@ Registered in England & Wales · Co. No. 16180320</textarea>
   function renderSidebarLines() {
     const container = document.getElementById('line-items-container');
     container.innerHTML = lineItems.map(l => `
-      <div class="line-item">
+      <div class="line-item" data-line-id="${l.id}">
         <button class="line-item-remove" onclick="removeLine('${l.id}')" title="Remove">×</button>
         <div class="form-field" style="margin-bottom:8px">
           <label>Description</label>
@@ -880,20 +881,33 @@ Registered in England & Wales · Co. No. 16180320</textarea>
           </div>
           <div class="form-field" style="margin-bottom:0">
             <label>Line Total</label>
-            <input type="text" value="${fmt(l.price * l.qty)}" readonly style="opacity:0.5;cursor:default">
+            <input type="text" value="${fmt(l.price * l.qty)}" readonly class="line-total-val" style="opacity:0.5;cursor:default">
           </div>
         </div>
       </div>
     `).join('');
   }
 
+  // Optimized update: Updates state and ONLY the specific total field in UI, avoiding re-render of the whole list
   function updateLine(id, field, val) {
     const l = lineItems.find(x => x.id === id);
     if (!l) return;
+    
+    // Update state
     if (field === 'qty') l.qty = parseFloat(val) || 1;
     else if (field === 'price') l.price = parseFloat(val) || 0;
     else l[field] = val;
-    renderSidebarLines();
+
+    // Update specific UI elements without destroying inputs
+    const row = document.querySelector(`[data-line-id="${id}"]`);
+    if (row) {
+        const totalInput = row.querySelector('.line-total-val');
+        if (totalInput) {
+            totalInput.value = fmt(l.price * l.qty);
+        }
+    }
+
+    // Update the main preview
     update();
   }
 
@@ -1028,41 +1042,80 @@ Registered in England & Wales · Co. No. 16180320</textarea>
     const invNum = document.getElementById('inv-number').value || 'INV';
     const el = document.getElementById('invoice-preview');
 
+    // Store original styles
+    const originalStyle = el.style.cssText;
+    
+    // Force dimensions for PDF capture
+    // A4 ratio: width 794px -> height 1123px for high quality screen DPI
+    // We force the element to be exactly A4 ratio height if content is short
+    const MIN_HEIGHT = 1123; 
+    const currentHeight = el.offsetHeight;
+    
+    // If content is shorter than A4, stretch it. If longer, let it grow.
+    if (currentHeight < MIN_HEIGHT) {
+        el.style.height = MIN_HEIGHT + 'px';
+        el.style.minHeight = '0';
+    } else {
+        el.style.height = 'auto';
+    }
+
     try {
       const canvas = await html2canvas(el, {
-        scale: 2,
+        scale: 2, // Higher scale for better PDF quality
         useCORS: true,
         backgroundColor: '#FDFCFA',
         logging: false,
-        windowWidth: 794,
+        windowWidth: 794, // Force render width
         width: 794
       });
 
+      // Restore styles immediately after capture
+      el.style.cssText = originalStyle;
+
       const { jsPDF } = window.jspdf;
+      // Standard A4 dimensions in mm
       const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
 
-      const pdfW = pdf.internal.pageSize.getWidth();
-      const pdfH = pdf.internal.pageSize.getHeight();
+      const pdfW = pdf.internal.pageSize.getWidth(); // 210mm
+      const pdfH = pdf.internal.pageSize.getHeight(); // 297mm
+      
       const imgW = canvas.width;
       const imgH = canvas.height;
+      
+      // Calculate ratio to fit image width to PDF width
       const ratio = pdfW / imgW;
       const scaledH = imgH * ratio;
 
+      // Determine if we need multiple pages
       if (scaledH <= pdfH) {
+        // Single Page
         pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, pdfW, scaledH);
       } else {
-        // Multi-page
+        // Multi-Page Logic
         let y = 0;
-        const pageH = pdfH / ratio;
+        // Height of one page in canvas pixels
+        const pageHInCanvasPx = imgH * (pdfH / scaledH);
+        
         while (y < imgH) {
+          if (y > 0) pdf.addPage();
+          
+          // Create a canvas for the current page slice
           const sliceCanvas = document.createElement('canvas');
           sliceCanvas.width = imgW;
-          sliceCanvas.height = Math.min(pageH, imgH - y);
+          sliceCanvas.height = Math.min(pageHInCanvasPx, imgH - y);
+          
           const ctx = sliceCanvas.getContext('2d');
+          // Fill white background for safety
+          ctx.fillStyle = '#FDFCFA';
+          ctx.fillRect(0, 0, sliceCanvas.width, sliceCanvas.height);
+          
+          // Draw the slice
           ctx.drawImage(canvas, 0, -y);
-          if (y > 0) pdf.addPage();
+          
+          // Add slice to PDF
           pdf.addImage(sliceCanvas.toDataURL('image/png'), 'PNG', 0, 0, pdfW, sliceCanvas.height * ratio);
-          y += pageH;
+          
+          y += pageHInCanvasPx;
         }
       }
 
@@ -1070,6 +1123,8 @@ Registered in England & Wales · Co. No. 16180320</textarea>
     } catch (e) {
       alert('PDF generation failed. Please try again.');
       console.error(e);
+      // Ensure restore on error
+      el.style.cssText = originalStyle;
     }
 
     btn.textContent = '⬇ Download PDF';
